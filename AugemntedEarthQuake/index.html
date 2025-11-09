@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Earthquake Survival AR</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #000;
+      color: #fff;
+    }
+
+    #ui {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      pointer-events: none;
+      padding: 16px;
+      z-index: 10;
+    }
+
+    .top-bar, .bottom-bar {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .top-bar {
+      justify-content: space-between;
+    }
+
+    .bottom-bar {
+      justify-content: center;
+    }
+
+    .pill {
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(0,0,0,0.6);
+      font-size: 12px;
+      backdrop-filter: blur(8px);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    button {
+      pointer-events: auto;
+      padding: 8px 14px;
+      border-radius: 999px;
+      border: none;
+      background: #10b981;
+      color: #000;
+      font-weight: 600;
+      font-size: 12px;
+      cursor: pointer;
+      box-shadow: 0 4px 18px rgba(0,0,0,0.4);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    button.danger {
+      background: #ef4444;
+      color: #fff;
+    }
+
+    button.secondary {
+      background: rgba(0,0,0,0.6);
+      color: #fff;
+    }
+
+    #scoreDisplay {
+      font-size: 14px;
+      font-weight: 600;
+      color: #22c55e;
+    }
+
+    #status {
+      font-size: 11px;
+      opacity: 0.9;
+    }
+
+    #countdown {
+      font-size: 18px;
+      font-weight: 700;
+      color: #f97316;
+      text-shadow: 0 0 10px #000;
+    }
+
+    #labelSafe {
+      color: #22c55e;
+    }
+
+    #labelDanger {
+      color: #ef4444;
+    }
+  </style>
+</head>
+<body>
+<div id="ui">
+  <div class="top-bar">
+    <div class="pill">
+      <span>EARTHQUAKE SURVIVAL AR</span>
+    </div>
+    <div class="pill">
+      <span id="scoreDisplay">Scan to calculate safety…</span>
+    </div>
+  </div>
+
+  <div class="bottom-bar">
+    <button id="btnMarkDanger" class="danger">+ Mark Danger</button>
+    <button id="btnMarkSafe" class="secondary">+ Mark Safe Zone</button>
+    <button id="btnQuake" class="danger">Start Quake Demo</button>
+    <div class="pill">
+      <span id="status">Tap where a bookshelf / window / table is.</span>
+    </div>
+    <div class="pill" id="countdown"></div>
+  </div>
+</div>
+
+<script type="module">
+  import * as THREE from 'https://unpkg.com/three@0.162.0/build/three.module.js';
+  import { ARButton } from 'https://unpkg.com/three@0.162.0/examples/jsm/webxr/ARButton.js';
+
+  let camera, scene, renderer;
+  let controller;
+  let reticle;
+  let hitTestSource = null;
+  let hitTestSourceRequested = false;
+
+  const hazards = [];
+  const safeZones = [];
+
+  const btnMarkDanger = document.getElementById('btnMarkDanger');
+  const btnMarkSafe = document.getElementById('btnMarkSafe');
+  const btnQuake = document.getElementById('btnQuake');
+  const statusEl = document.getElementById('status');
+  const scoreEl = document.getElementById('scoreDisplay');
+  const countdownEl = document.getElementById('countdown');
+
+  let currentPlacementMode = null; // 'danger' | 'safe'
+  let quakeActive = false;
+  let quakeTimer = null;
+
+  init();
+  animate();
+
+  function init() {
+    // THREE.js basics
+    scene = new THREE.Scene();
+
+    camera = new THREE.PerspectiveCamera(
+      70,
+      window.innerWidth / window.innerHeight,
+      0.01,
+      20
+    );
+
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    // AR button
+    document.body.appendChild(
+      ARButton.createButton(renderer, {
+        requiredFeatures: ['hit-test'],
+        optionalFeatures: ['dom-overlay'],
+        domOverlay: { root: document.body }
+      })
+    );
+
+    // Reticle (placement helper)
+    const geometry = new THREE.RingGeometry(0.08, 0.1, 32).rotateX(-Math.PI / 2);
+    const material = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    reticle = new THREE.Mesh(geometry, material);
+    reticle.matrixAutoUpdate = false;
+    reticle.visible = false;
+    scene.add(reticle);
+
+    // Controller: tap to place
+    controller = renderer.xr.getController(0);
+    controller.addEventListener('select', onSelect);
+    scene.add(controller);
+
+    // UI events
+    btnMarkDanger.onclick = () => {
+      currentPlacementMode = 'danger';
+      statusEl.textContent = 'Tap in AR to place a DANGER zone.';
+    };
+
+    btnMarkSafe.onclick = () => {
+      currentPlacementMode = 'safe';
+      statusEl.textContent = 'Tap in AR to place a SAFE zone.';
+    };
+
+    btnQuake.onclick = () => {
+      if (!safeZones.length) {
+        statusEl.textContent = 'Add at least one safe zone before quake demo.';
+        return;
+      }
+      startQuakeDemo();
+    };
+
+    window.addEventListener('resize', onWindowResize);
+    speak('Point, scan, survive. Mark hazards and safe zones to begin.');
+  }
+
+  function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
+  function onSelect() {
+    if (!reticle.visible || !currentPlacementMode) return;
+
+    const pose = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+
+    if (currentPlacementMode === 'danger') {
+      const mesh = createZoneSphere(0.08, 0xff0000);
+      mesh.position.copy(pose);
+      scene.add(mesh);
+      hazards.push(mesh);
+      statusEl.textContent = 'Danger zone added. Add more or mark safe zones.';
+    }
+
+    if (currentPlacementMode === 'safe') {
+      const mesh = createZoneSphere(0.08, 0x00ff00);
+      mesh.position.copy(pose);
+      scene.add(mesh);
+      safeZones.push(mesh);
+      statusEl.textContent = 'Safe zone added. Try the quake demo.';
+    }
+
+    currentPlacementMode = null;
+    updateSurvivalScore();
+  }
+
+  function createZoneSphere(radius, color) {
+    const geometry = new THREE.SphereGeometry(radius, 16, 16);
+    const material = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.9
+    });
+    return new THREE.Mesh(geometry, material);
+  }
+
+  function animate() {
+    renderer.setAnimationLoop(renderXR);
+  }
+
+  function renderXR(timestamp, frame) {
+    const session = renderer.xr.getSession();
+    if (session && frame) {
+      const referenceSpace = renderer.xr.getReferenceSpace();
+
+      // Request hit-test source once
+      if (!hitTestSourceRequested) {
+        const viewerSpace = session.requestReferenceSpace('viewer');
+        viewerSpace.then((space) => {
+          session.requestHitTestSource({ space }).then((source) => {
+            hitTestSource = source;
+          });
+        });
+        hitTestSourceRequested = true;
+      }
+
+      if (hitTestSource) {
+        const hitTestResults = frame.getHitTestResults(hitTestSource);
+
+        if (hitTestResults.length) {
+          const hit = hitTestResults[0];
+          const pose = hit.getPose(referenceSpace);
+          reticle.visible = true;
+          reticle.matrix.fromArray(pose.transform.matrix);
+        } else {
+          reticle.visible = false;
+        }
+      }
+
+      // Continuously recompute score based on camera position
+      updateSurvivalScore();
+    }
+
+    renderer.render(scene, camera);
+  }
+
+  // --- Survival Scoring Engine (Heuristic, hackathon friendly) ---
+
+  function updateSurvivalScore() {
+    const cam = renderer.xr.getCamera(camera);
+    if (!cam) return;
+
+    const camPos = new THREE.Vector3();
+    cam.getWorldPosition(camPos);
+
+    const dangerDist = nearestDistance(camPos, hazards);
+    const safeDist = nearestDistance(camPos, safeZones);
+
+    // Heuristic:
+    // - Being near hazards reduces score.
+    // - Being near safe zones increases score.
+    let score = 50;
+
+    if (Number.isFinite(dangerDist)) {
+      if (dangerDist < 0.5) score -= 40;
+      else if (dangerDist < 1.0) score -= 25;
+      else if (dangerDist < 2.0) score -= 10;
+    }
+
+    if (Number.isFinite(safeDist)) {
+      if (safeDist < 0.5) score += 40;
+      else if (safeDist < 1.0) score += 25;
+      else if (safeDist < 2.0) score += 10;
+    }
+
+    score = Math.max(0, Math.min(100, score));
+
+    let color = '#f97316';
+    if (score >= 75) color = '#22c55e';
+    else if (score <= 30) color = '#ef4444';
+
+    scoreEl.style.color = color;
+    scoreEl.textContent = `Estimated survival chance here: ${score}%`;
+
+    if (score <= 30) {
+      statusEl.textContent = 'Move toward a green zone. You are in a high-risk spot.';
+    } else if (score >= 75) {
+      statusEl.textContent = 'This is a strong safe position. Low falling hazard nearby.';
+    }
+  }
+
+  function nearestDistance(point, objects) {
+    if (!objects.length) return Infinity;
+    let min = Infinity;
+    for (const obj of objects) {
+      const d = point.distanceTo(obj.position);
+      if (d < min) min = d;
+    }
+    return min;
+  }
+
+  // --- Quake Demo Mode ---
+
+  function startQuakeDemo() {
+    if (quakeActive) return;
+
+    quakeActive = true;
+    let timeLeft = 10;
+    countdownEl.textContent = `EARTHQUAKE! Get safe: ${timeLeft}s`;
+    speak('EARTHQUAKE! MOVE NOW! Follow the green zones!');
+
+    // Highlight nearest safe zone with pulsing scale
+    const interval = setInterval(() => {
+      timeLeft--;
+      if (timeLeft > 0) {
+        countdownEl.textContent = `Get to safety: ${timeLeft}s`;
+        pulseNearestSafeZone();
+        updateSurvivalScore();
+      } else {
+        clearInterval(interval);
+        quakeActive = false;
+        countdownEl.textContent = '';
+        const msg = evaluateOutcome();
+        statusEl.textContent = msg;
+        speak(msg);
+      }
+    }, 1000);
+
+    quakeTimer = interval;
+  }
+
+  function pulseNearestSafeZone() {
+    const cam = renderer.xr.getCamera(camera);
+    const camPos = new THREE.Vector3();
+    cam.getWorldPosition(camPos);
+
+    let nearest = null;
+    let min = Infinity;
+    for (const s of safeZones) {
+      const d = camPos.distanceTo(s.position);
+      if (d < min) {
+        min = d;
+        nearest = s;
+      }
+    }
+    if (!nearest) return;
+
+    const scale = 1 + 0.25 * Math.sin(Date.now() / 150);
+    nearest.scale.set(scale, scale, scale);
+  }
+
+  function evaluateOutcome() {
+    const cam = renderer.xr.getCamera(camera);
+    const camPos = new THREE.Vector3();
+    cam.getWorldPosition(camPos);
+
+    const safeDist = nearestDistance(camPos, safeZones);
+    const dangerDist = nearestDistance(camPos, hazards);
+
+    if (safeDist < 0.6 && safeDist < dangerDist) {
+      return 'You made it to a safe zone. HOLD ON!';
+    } else if (dangerDist < 0.6) {
+      return 'You stayed in the fall zone. In a real quake, this spot is dangerous.';
+    } else {
+      return 'You are partially safe, but could do better. Identify closer cover points.';
+    }
+  }
+
+  // --- Simple Voice Helper ---
+
+  function speak(text) {
+    if (!('speechSynthesis' in window)) return;
+    const utter = new SpeechSynthesisUtterance(text);
+    window.speechSynthesis.speak(utter);
+  }
+</script>
+</body>
+</html>
